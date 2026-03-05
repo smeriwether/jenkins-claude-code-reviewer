@@ -28,10 +28,7 @@
  *   dockerImage                - Docker image to run in (default: node:20-slim)
  *   githubRepo                 - GitHub repo override (format: owner/repo; default: auto-detected from GIT_URL)
  *   prNumber                   - PR number override (default: auto-detected)
- *
- * AWS authentication note:
- * - This step intentionally does NOT bind AWS access key/secret key.
- * - It expects role-based auth to be provided by the Jenkins agent runtime (instance profile on EC2, IRSA on EKS, etc.).
+ *   awsCredentialsId           - Jenkins credentials ID for AWS keys (type: Username/Password; default: '' = use role-based auth)
  */
 
 def call(Map config = [:]) {
@@ -46,6 +43,7 @@ def call(Map config = [:]) {
     def maxDiffSize               = config.get('maxDiffSize', '100000')
     def failOnFindings            = config.get('failOnFindings', false)
     def dockerImage               = config.get('dockerImage', 'node:20-slim')
+    def awsCredentialsId          = config.get('awsCredentialsId', '')
 
     // Resolve PR number from environment
     // Supports: GitHub Branch Source plugin (CHANGE_ID), GitHub Pull Request Builder (ghprbPullId),
@@ -80,11 +78,19 @@ def call(Map config = [:]) {
             python3 --version
         '''
 
-        // Bind GitHub credentials and run the review script.
-        // AWS credentials are expected to come from the environment (instance profile, IRSA, etc.).
-        withCredentials([
+        // Build credential bindings: always bind GitHub token, optionally bind AWS keys
+        def credBindings = [
             string(credentialsId: githubTokenCredentialsId, variable: 'GITHUB_TOKEN')
-        ]) {
+        ]
+        if (awsCredentialsId) {
+            credBindings.add(usernamePassword(
+                credentialsId: awsCredentialsId,
+                usernameVariable: 'AWS_ACCESS_KEY_ID',
+                passwordVariable: 'AWS_SECRET_ACCESS_KEY'
+            ))
+        }
+
+        withCredentials(credBindings) {
             def envVars = [
                 "CLAUDE_CODE_USE_BEDROCK=1",
                 "AWS_REGION=${awsRegion}",

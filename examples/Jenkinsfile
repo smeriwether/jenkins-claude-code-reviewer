@@ -7,7 +7,8 @@
  *   1. Add this repo as a Jenkins Shared Library named "claude-code-reviewer"
  *      (Manage Jenkins -> System -> Global Pipeline Libraries)
  *   2. Create Jenkins credentials:
- *      - 'github-token' -> Secret text (GitHub PAT with repo scope)
+ *      - 'github-token'      -> Secret text (GitHub PAT with repo scope)
+ *      - 'aws-bedrock-creds' -> Username/Password (AWS access key ID / secret access key)
  *   3. Ensure Claude models are enabled in your AWS Bedrock account.
  */
 
@@ -39,6 +40,7 @@ pipeline {
             steps {
                 claudeReview(
                     githubTokenCredentialsId: 'github-token',
+                    awsCredentialsId: 'aws-bedrock-creds',
                     awsRegion: 'us-east-1',
                     prNumber: params.PR_NUMBER ?: '',
                     githubRepo: params.GITHUB_REPO ?: '',
