@@ -1,16 +1,18 @@
 /**
- * Example Jenkinsfile — drop this into any repo to enable Claude Code PR reviews.
+ * Example Jenkinsfile — drop this into any repo to enable Claude Code MR reviews on GitLab.
  *
  * Prerequisites:
  *   1. Add this repo as a Jenkins Shared Library named "claude-code-reviewer"
  *      (Manage Jenkins → System → Global Pipeline Libraries)
  *   2. Create Jenkins credentials:
- *      - 'github-token'      → Secret text (GitHub PAT with repo scope)
+ *      - 'gitlab-token'      → Secret text (GitLab PAT with api scope)
  *      - 'aws-bedrock-creds' → Username/Password (AWS access key / secret key)
  *   3. Ensure Claude models are enabled in your AWS Bedrock account.
+ *   4. Set GITLAB_PROJECT_ID as a pipeline parameter or env var.
  *
- * The pipeline runs only on pull request builds (CHANGE_ID is set by the
- * GitHub Branch Source plugin).
+ * The pipeline runs only on merge request builds.
+ * MR IID is auto-detected from the GitLab Branch Source plugin (gitlabMergeRequestIid)
+ * or the MR_IID / CHANGE_ID env vars.
  */
 
 @Library('claude-code-reviewer') _
@@ -26,20 +28,29 @@ pipeline {
     stages {
         stage('Claude Code Review') {
             when {
-                expression { env.CHANGE_ID != null }
+                expression {
+                    env.gitlabMergeRequestIid != null ||
+                    env.MR_IID != null ||
+                    env.CHANGE_ID != null
+                }
             }
             steps {
                 claudeReview(
                     awsCredentialsId: 'aws-bedrock-creds',
-                    githubTokenCredentialsId: 'github-token',
+                    gitlabTokenCredentialsId: 'gitlab-token',
                     awsRegion: 'us-east-1',
+
+                    // Required: GitLab project ID (numeric or path-encoded)
+                    // gitlabProjectId: '12345',
+
+                    // Optional: self-hosted GitLab
+                    // gitlabApiUrl: 'https://gitlab.example.com/api/v4',
 
                     // Optional overrides:
                     // claudeModel: 'us.anthropic.claude-sonnet-4-6',
                     // includePatterns: '*.py,*.js,*.ts,*.go,*.java',
                     // excludePatterns: '*.lock,*.min.js,package-lock.json',
                     // maxDiffSize: '150000',
-                    // reviewEvent: 'COMMENT',
                     // failOnFindings: false,
                 )
             }

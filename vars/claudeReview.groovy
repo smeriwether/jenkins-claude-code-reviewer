@@ -3,60 +3,65 @@
 /**
  * claudeReview — Jenkins Shared Library step
  *
- * Runs Claude Code as an automated PR reviewer via AWS Bedrock.
- * Posts review comments (summary + inline) to the GitHub pull request.
+ * Runs Claude Code as an automated MR reviewer via AWS Bedrock.
+ * Posts review comments (summary note + inline discussions) to a GitLab merge request.
  *
  * Usage in a Jenkinsfile:
  *
  *   @Library('claude-code-reviewer') _
  *   claudeReview(
  *       awsCredentialsId: 'aws-bedrock-creds',
- *       githubTokenCredentialsId: 'github-token',
+ *       gitlabTokenCredentialsId: 'gitlab-token',
  *       awsRegion: 'us-east-1',
  *   )
  *
  * Parameters:
- *   awsCredentialsId          - Jenkins credentials ID for AWS (type: AWS Credentials or Username/Password)
- *   githubTokenCredentialsId  - Jenkins credentials ID for GitHub token (type: Secret text)
- *   awsRegion                 - AWS region for Bedrock (default: us-east-1)
- *   claudeModel               - Bedrock model ID (default: auto-selected by Claude Code)
- *   maxTokens                 - Max output tokens (default: 16384)
- *   includePatterns           - Comma-separated file globs to include (e.g. "*.py,*.js")
- *   excludePatterns           - Comma-separated file globs to exclude (e.g. "*.lock,*.min.js")
- *   maxDiffSize               - Max diff bytes before truncation (default: 100000)
- *   reviewEvent               - GitHub review event: COMMENT, APPROVE, REQUEST_CHANGES (default: COMMENT)
- *   failOnFindings            - Fail the build on critical findings (default: false)
- *   dockerImage               - Docker image to run in (default: node:20-slim)
+ *   awsCredentialsId           - Jenkins credentials ID for AWS (type: Username/Password)
+ *   gitlabTokenCredentialsId   - Jenkins credentials ID for GitLab PAT (type: Secret text)
+ *   awsRegion                  - AWS region for Bedrock (default: us-east-1)
+ *   gitlabApiUrl               - GitLab API base URL (default: https://gitlab.com/api/v4)
+ *   claudeModel                - Bedrock model ID (default: auto-selected by Claude Code)
+ *   maxTokens                  - Max output tokens (default: 16384)
+ *   includePatterns            - Comma-separated file globs to include (e.g. "*.py,*.js")
+ *   excludePatterns            - Comma-separated file globs to exclude (e.g. "*.lock,*.min.js")
+ *   maxDiffSize                - Max diff bytes before truncation (default: 100000)
+ *   failOnFindings             - Fail the build on critical findings (default: false)
+ *   dockerImage                - Docker image to run in (default: node:20-slim)
+ *   gitlabProjectId            - GitLab project ID override (default: auto-detected)
+ *   mrIid                      - MR IID override (default: auto-detected)
  */
 
 def call(Map config = [:]) {
     // Defaults
-    def awsCredentialsId         = config.get('awsCredentialsId', 'aws-bedrock-creds')
-    def githubTokenCredentialsId = config.get('githubTokenCredentialsId', 'github-token')
-    def awsRegion                = config.get('awsRegion', 'us-east-1')
-    def claudeModel              = config.get('claudeModel', '')
-    def maxTokens                = config.get('maxTokens', '16384')
-    def includePatterns          = config.get('includePatterns', '')
-    def excludePatterns          = config.get('excludePatterns', '')
-    def maxDiffSize              = config.get('maxDiffSize', '100000')
-    def reviewEvent              = config.get('reviewEvent', 'COMMENT')
-    def failOnFindings           = config.get('failOnFindings', false)
-    def dockerImage              = config.get('dockerImage', 'node:20-slim')
+    def awsCredentialsId          = config.get('awsCredentialsId', 'aws-bedrock-creds')
+    def gitlabTokenCredentialsId  = config.get('gitlabTokenCredentialsId', 'gitlab-token')
+    def awsRegion                 = config.get('awsRegion', 'us-east-1')
+    def gitlabApiUrl              = config.get('gitlabApiUrl', 'https://gitlab.com/api/v4')
+    def claudeModel               = config.get('claudeModel', '')
+    def maxTokens                 = config.get('maxTokens', '16384')
+    def includePatterns           = config.get('includePatterns', '')
+    def excludePatterns           = config.get('excludePatterns', '')
+    def maxDiffSize               = config.get('maxDiffSize', '100000')
+    def failOnFindings            = config.get('failOnFindings', false)
+    def dockerImage               = config.get('dockerImage', 'node:20-slim')
 
-    // Resolve PR number and repo from environment
-    // Supports: GitHub Branch Source plugin, Generic Webhook Trigger, or manual override
-    def prNumber = config.get('prNumber', env.CHANGE_ID ?: env.ghprbPullId ?: env.PR_NUMBER ?: '')
-    def repository = config.get('repository', env.CHANGE_URL?.replaceAll('https://github.com/', '')?.replaceAll('/pull/.*', '') ?: env.GITHUB_REPOSITORY ?: '')
+    // Resolve MR IID and project ID from environment
+    // Supports: GitLab Branch Source plugin (gitlabMergeRequestIid, gitlabSourceRepoName),
+    //           explicit env vars, or manual overrides
+    def mrIid = config.get('mrIid',
+        env.gitlabMergeRequestIid ?: env.gitlabMergeRequestId ?: env.MR_IID ?: env.CHANGE_ID ?: '')
+    def gitlabProjectId = config.get('gitlabProjectId',
+        env.gitlabMergeRequestTargetProjectId ?: env.GITLAB_PROJECT_ID ?: '')
 
-    if (!prNumber) {
-        echo "claudeReview: No PR number detected (CHANGE_ID / ghprbPullId / PR_NUMBER). Skipping."
+    if (!mrIid) {
+        echo "claudeReview: No MR IID detected (gitlabMergeRequestIid / MR_IID / CHANGE_ID). Skipping."
         return
     }
-    if (!repository) {
-        error "claudeReview: Could not determine GitHub repository. Set 'repository' parameter or GITHUB_REPOSITORY env var."
+    if (!gitlabProjectId) {
+        error "claudeReview: Could not determine GitLab project ID. Set 'gitlabProjectId' parameter or GITLAB_PROJECT_ID env var."
     }
 
-    echo "claudeReview: Reviewing PR #${prNumber} in ${repository}"
+    echo "claudeReview: Reviewing MR !${mrIid} in project ${gitlabProjectId}"
 
     docker.image(dockerImage).inside('--entrypoint=""') {
         // Install Claude Code
@@ -67,7 +72,7 @@ def call(Map config = [:]) {
 
         // Bind credentials and run the review script
         withCredentials([
-            string(credentialsId: githubTokenCredentialsId, variable: 'GITHUB_TOKEN'),
+            string(credentialsId: gitlabTokenCredentialsId, variable: 'GITLAB_TOKEN'),
             usernamePassword(
                 credentialsId: awsCredentialsId,
                 usernameVariable: 'AWS_ACCESS_KEY_ID',
@@ -77,14 +82,14 @@ def call(Map config = [:]) {
             def envVars = [
                 "CLAUDE_CODE_USE_BEDROCK=1",
                 "AWS_REGION=${awsRegion}",
-                "GITHUB_REPOSITORY=${repository}",
-                "PR_NUMBER=${prNumber}",
+                "GITLAB_API_URL=${gitlabApiUrl}",
+                "GITLAB_PROJECT_ID=${gitlabProjectId}",
+                "MR_IID=${mrIid}",
                 "CLAUDE_MODEL=${claudeModel}",
                 "CLAUDE_MAX_TOKENS=${maxTokens}",
                 "INCLUDE_PATTERNS=${includePatterns}",
                 "EXCLUDE_PATTERNS=${excludePatterns}",
                 "MAX_DIFF_SIZE=${maxDiffSize}",
-                "REVIEW_EVENT=${reviewEvent}",
                 "FAIL_ON_FINDINGS=${failOnFindings}",
             ]
 
