@@ -1,22 +1,22 @@
 #!/usr/bin/env python3
 """
-Claude Code MR Reviewer — collects diff, calls Claude Code via Bedrock,
-posts structured review comments to GitLab merge requests.
+Claude Code PR Reviewer — collects diff, calls Claude Code via Bedrock,
+posts structured review comments to GitHub pull requests.
 
 Usage:
     python3 review.py
 
 Required environment variables:
-    GITLAB_TOKEN        - GitLab personal access token (api scope)
-    GITLAB_PROJECT_ID   - GitLab project ID (numeric) or URL-encoded path
-    MR_IID              - Merge request IID (internal ID)
+    GITHUB_TOKEN        - GitHub personal access token (repo scope)
+    GITHUB_REPO         - GitHub repository (format: owner/repo)
+    PR_NUMBER           - Pull request number
     CLAUDE_CODE_USE_BEDROCK=1
     AWS_REGION          - e.g. us-east-1
     AWS auth is expected via the standard AWS credential chain (instance profile, IRSA, assumed role, etc.).
     Do NOT require long-lived AWS access keys.
 
 Optional environment variables:
-    GITLAB_API_URL          - GitLab API base URL (default: https://gitlab.com/api/v4)
+    GITHUB_API_URL          - GitHub API base URL (default: https://api.github.com)
     CLAUDE_MODEL            - Bedrock model ID (default: auto)
     CLAUDE_MAX_TOKENS       - max output tokens (default: 16384)
     INCLUDE_PATTERNS        - comma-separated globs to include (e.g. "*.py,*.js")
@@ -33,17 +33,16 @@ import fnmatch
 import re
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError
-from urllib.parse import quote as urlquote
 
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
-GITLAB_TOKEN = os.environ["GITLAB_TOKEN"]
-GITLAB_PROJECT_ID = os.environ["GITLAB_PROJECT_ID"]
-MR_IID = os.environ["MR_IID"]
-GITLAB_API_URL = os.environ.get("GITLAB_API_URL", "https://gitlab.com/api/v4")
+GITHUB_TOKEN = os.environ["GITHUB_TOKEN"]
+GITHUB_REPO = os.environ["GITHUB_REPO"]
+PR_NUMBER = os.environ["PR_NUMBER"]
+GITHUB_API_URL = os.environ.get("GITHUB_API_URL", "https://api.github.com")
 
 # Accept either CLAUDE_MODEL (legacy) or BEDROCK_INFERENCE_PROFILE (preferred)
 CLAUDE_MODEL = os.environ.get("BEDROCK_INFERENCE_PROFILE", os.environ.get("CLAUDE_MODEL", ""))
@@ -60,9 +59,6 @@ EXCLUDE_PATTERNS = [
 ]
 MAX_DIFF_SIZE = int(os.environ.get("MAX_DIFF_SIZE", "100000"))
 FAIL_ON_FINDINGS = os.environ.get("FAIL_ON_FINDINGS", "false").lower() == "true"
-
-# URL-encode the project ID if it contains slashes (path-based ID)
-PROJECT_ID_ENCODED = urlquote(GITLAB_PROJECT_ID, safe="")
 
 
 # ---------------------------------------------------------------------------
@@ -113,53 +109,43 @@ REVIEW_SCHEMA = {
 # ---------------------------------------------------------------------------
 
 
-def gitlab_api(method: str, path: str, body: dict | None = None) -> dict | list:
-    """Make a GitLab API request."""
-    url = f"{GITLAB_API_URL}{path}"
+def github_api(method: str, path: str, body: dict | None = None,
+               accept: str = "application/vnd.github.v3+json") -> dict | list | str:
+    """Make a GitHub API request. Returns raw string when accept is diff, JSON otherwise."""
+    url = f"{GITHUB_API_URL}{path}"
     data = json.dumps(body).encode() if body else None
     req = Request(url, data=data, method=method)
-    req.add_header("PRIVATE-TOKEN", GITLAB_TOKEN)
+    req.add_header("Authorization", f"token {GITHUB_TOKEN}")
+    req.add_header("Accept", accept)
     if data:
         req.add_header("Content-Type", "application/json")
     try:
         with urlopen(req) as resp:
-            return json.loads(resp.read().decode())
+            raw = resp.read().decode()
+            if "diff" in accept:
+                return raw
+            return json.loads(raw)
     except HTTPError as e:
         error_body = e.read().decode() if e.fp else ""
-        print(f"GitLab API error {e.code}: {error_body}", file=sys.stderr)
+        print(f"GitHub API error {e.code}: {error_body}", file=sys.stderr)
         raise
 
 
-def get_mr_info() -> dict:
-    """Fetch MR metadata including diff_refs."""
-    return gitlab_api(
+def get_pr_info() -> dict:
+    """Fetch PR metadata including head SHA."""
+    return github_api(
         "GET",
-        f"/projects/{PROJECT_ID_ENCODED}/merge_requests/{MR_IID}",
+        f"/repos/{GITHUB_REPO}/pulls/{PR_NUMBER}",
     )
 
 
-def get_mr_changes() -> list[dict]:
-    """Fetch MR file changes with diffs."""
-    data = gitlab_api(
+def get_pr_diff() -> str:
+    """Fetch the PR diff as raw unified diff text."""
+    return github_api(
         "GET",
-        f"/projects/{PROJECT_ID_ENCODED}/merge_requests/{MR_IID}/changes",
+        f"/repos/{GITHUB_REPO}/pulls/{PR_NUMBER}",
+        accept="application/vnd.github.v3.diff",
     )
-    return data.get("changes", [])
-
-
-def build_unified_diff(changes: list[dict]) -> str:
-    """Reconstruct a unified diff string from GitLab MR changes."""
-    parts = []
-    for change in changes:
-        old_path = change.get("old_path", "")
-        new_path = change.get("new_path", "")
-        diff_text = change.get("diff", "")
-        if not diff_text:
-            continue
-        # Add a standard diff --git header
-        parts.append(f"diff --git a/{old_path} b/{new_path}")
-        parts.append(diff_text.rstrip("\n"))
-    return "\n".join(parts)
 
 
 def filter_diff(diff: str) -> str:
@@ -255,12 +241,12 @@ def validate_comments(
     return valid
 
 
-def run_claude_review(diff: str, mr_info: dict) -> dict:
+def run_claude_review(diff: str, pr_info: dict) -> dict:
     """Run Claude Code in print mode with structured output."""
-    prompt = f"""You are an expert code reviewer. Review the following merge request diff.
+    prompt = f"""You are an expert code reviewer. Review the following pull request diff.
 
-MR Title: {mr_info.get("title", "")}
-MR Description: {mr_info.get("description", "") or "No description provided."}
+PR Title: {pr_info.get("title", "")}
+PR Description: {pr_info.get("body", "") or "No description provided."}
 
 INSTRUCTIONS:
 - Focus on: bugs, security issues, performance problems, and code quality.
@@ -318,8 +304,8 @@ DIFF:
         return response
 
 
-def post_review(mr_info: dict, review: dict, diff_line_map: dict) -> None:
-    """Post the review to GitLab as MR notes and inline discussions."""
+def post_review(pr_info: dict, review: dict, diff_line_map: dict) -> None:
+    """Post the review to GitHub as a PR review with inline comments."""
     summary = review.get("summary", "No summary provided.")
     raw_comments = review.get("comments", [])
 
@@ -338,7 +324,7 @@ def post_review(mr_info: dict, review: dict, diff_line_map: dict) -> None:
         "nitpick": "\U0001f9f9",
     }
 
-    # Build summary note body
+    # Build summary body
     body_parts = [
         "## Claude Code Review\n",
         summary,
@@ -363,29 +349,72 @@ def post_review(mr_info: dict, review: dict, diff_line_map: dict) -> None:
 
     summary_body = "\n".join(body_parts)
 
-    # Post summary as an MR note
-    print("Posting summary note...", file=sys.stderr)
-    gitlab_api(
-        "POST",
-        f"/projects/{PROJECT_ID_ENCODED}/merge_requests/{MR_IID}/notes",
-        {"body": summary_body},
-    )
+    # Get the head commit SHA for the review
+    commit_id = pr_info.get("head", {}).get("sha", "")
 
-    # Post inline comments as MR discussions with position info
-    diff_refs = mr_info.get("diff_refs", {})
-    base_sha = diff_refs.get("base_sha", "")
-    head_sha = diff_refs.get("head_sha", "")
-    start_sha = diff_refs.get("start_sha", "")
-
-    if not (base_sha and head_sha and start_sha):
+    if not commit_id:
         print(
-            "  Warning: diff_refs missing from MR info — skipping inline comments.",
+            "  Warning: head SHA missing from PR info — posting summary only.",
             file=sys.stderr,
         )
+        _post_pr_comment(summary_body)
         if comments:
-            # Fall back: post all inline comments as a single note
-            _post_comments_as_note(comments, severity_icons)
+            _post_comments_as_issue_comment(comments, severity_icons)
         return
+
+    # Build inline comment objects for the review API
+    review_comments = []
+    for c in comments:
+        sev = c.get("severity", "suggestion")
+        icon = severity_icons.get(sev, "")
+        comment_body = f"**{icon} {sev}**: {c['body']}"
+        review_comments.append({
+            "path": c["path"],
+            "line": c["line"],
+            "side": "RIGHT",
+            "body": comment_body,
+        })
+
+    # Try to post as a single atomic PR review
+    print("Posting PR review...", file=sys.stderr)
+    try:
+        github_api(
+            "POST",
+            f"/repos/{GITHUB_REPO}/pulls/{PR_NUMBER}/reviews",
+            {
+                "commit_id": commit_id,
+                "body": summary_body,
+                "event": "COMMENT",
+                "comments": review_comments,
+            },
+        )
+        print(
+            f"  Review posted: {len(review_comments)} inline comment(s).",
+            file=sys.stderr,
+        )
+        print("Review posted successfully.", file=sys.stderr)
+        return
+    except HTTPError as e:
+        if e.code == 422:
+            print(
+                "  Atomic review failed (422) — falling back to individual comments.",
+                file=sys.stderr,
+            )
+        else:
+            raise
+
+    # Fallback: post summary-only review, then try individual comments
+    print("  Posting summary-only review...", file=sys.stderr)
+    github_api(
+        "POST",
+        f"/repos/{GITHUB_REPO}/pulls/{PR_NUMBER}/reviews",
+        {
+            "commit_id": commit_id,
+            "body": summary_body,
+            "event": "COMMENT",
+            "comments": [],
+        },
+    )
 
     posted = 0
     failed_comments = []
@@ -394,28 +423,24 @@ def post_review(mr_info: dict, review: dict, diff_line_map: dict) -> None:
         icon = severity_icons.get(sev, "")
         comment_body = f"**{icon} {sev}**: {c['body']}"
 
-        position = {
-            "base_sha": base_sha,
-            "head_sha": head_sha,
-            "start_sha": start_sha,
-            "position_type": "text",
-            "new_path": c["path"],
-            "old_path": c["path"],
-            "new_line": c["line"],
-        }
-
         try:
-            gitlab_api(
+            github_api(
                 "POST",
-                f"/projects/{PROJECT_ID_ENCODED}/merge_requests/{MR_IID}/discussions",
-                {"body": comment_body, "position": position},
+                f"/repos/{GITHUB_REPO}/pulls/{PR_NUMBER}/comments",
+                {
+                    "commit_id": commit_id,
+                    "path": c["path"],
+                    "line": c["line"],
+                    "side": "RIGHT",
+                    "body": comment_body,
+                },
             )
             posted += 1
         except HTTPError:
             failed_comments.append(c)
             print(
                 f"  Failed to post inline comment on {c['path']}:{c['line']} — "
-                "will include in fallback note.",
+                "will include in fallback comment.",
                 file=sys.stderr,
             )
 
@@ -424,27 +449,32 @@ def post_review(mr_info: dict, review: dict, diff_line_map: dict) -> None:
         file=sys.stderr,
     )
 
-    # If any inline comments failed, post them as a fallback note
+    # If any inline comments failed, post them as a PR issue comment
     if failed_comments:
-        _post_comments_as_note(failed_comments, severity_icons)
+        _post_comments_as_issue_comment(failed_comments, severity_icons)
 
     print("Review posted successfully.", file=sys.stderr)
 
 
-def _post_comments_as_note(comments: list[dict], severity_icons: dict) -> None:
-    """Post inline comments as a single MR note (fallback when discussions fail)."""
+def _post_pr_comment(body: str) -> None:
+    """Post a comment on the PR (issue comment endpoint)."""
+    github_api(
+        "POST",
+        f"/repos/{GITHUB_REPO}/issues/{PR_NUMBER}/comments",
+        {"body": body},
+    )
+
+
+def _post_comments_as_issue_comment(comments: list[dict], severity_icons: dict) -> None:
+    """Post inline comments as a single PR comment (fallback when review comments fail)."""
     lines = ["### Inline Comments (fallback)\n"]
     for c in comments:
         sev = c.get("severity", "suggestion")
         icon = severity_icons.get(sev, "")
         lines.append(f"**{icon} {sev}** — `{c['path']}:{c['line']}`\n{c['body']}\n")
 
-    gitlab_api(
-        "POST",
-        f"/projects/{PROJECT_ID_ENCODED}/merge_requests/{MR_IID}/notes",
-        {"body": "\n".join(lines)},
-    )
-    print("  Fallback note posted with inline comments.", file=sys.stderr)
+    _post_pr_comment("\n".join(lines))
+    print("  Fallback comment posted with inline comments.", file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------
@@ -453,24 +483,20 @@ def _post_comments_as_note(comments: list[dict], severity_icons: dict) -> None:
 
 
 def main() -> int:
-    print(f"Reviewing MR !{MR_IID} in project {GITLAB_PROJECT_ID}", file=sys.stderr)
+    print(f"Reviewing PR #{PR_NUMBER} in {GITHUB_REPO}", file=sys.stderr)
 
-    # 1. Fetch MR info and changes
-    mr_info = get_mr_info()
-    changes = get_mr_changes()
-    print(f"  {len(changes)} file(s) changed in MR", file=sys.stderr)
-
-    # 2. Build unified diff from changes
-    diff = build_unified_diff(changes)
+    # 1. Fetch PR info and diff
+    pr_info = get_pr_info()
+    diff = get_pr_diff()
     print(f"  Diff size: {len(diff)} bytes", file=sys.stderr)
 
-    # 3. Filter diff
+    # 2. Filter diff
     diff = filter_diff(diff)
     if not diff.strip():
         print("  No files match filters — skipping review.", file=sys.stderr)
         return 0
 
-    # 4. Truncate if too large
+    # 3. Truncate if too large
     if len(diff) > MAX_DIFF_SIZE:
         print(
             f"  Diff exceeds {MAX_DIFF_SIZE} bytes — truncating.",
@@ -478,7 +504,7 @@ def main() -> int:
         )
         diff = diff[:MAX_DIFF_SIZE] + "\n... [truncated]"
 
-    # 5. Parse diff for line validation
+    # 4. Parse diff for line validation
     diff_line_map = parse_diff_line_map(diff)
     changed_files = len(diff_line_map)
     changed_lines = sum(len(v) for v in diff_line_map.values())
@@ -487,13 +513,13 @@ def main() -> int:
         file=sys.stderr,
     )
 
-    # 6. Run Claude Code review
-    review = run_claude_review(diff, mr_info)
+    # 5. Run Claude Code review
+    review = run_claude_review(diff, pr_info)
 
-    # 7. Post review to GitLab
-    post_review(mr_info, review, diff_line_map)
+    # 6. Post review to GitHub
+    post_review(pr_info, review, diff_line_map)
 
-    # 8. Optionally fail the build
+    # 7. Optionally fail the build
     findings = len(review.get("comments", []))
     critical = sum(
         1 for c in review.get("comments", []) if c.get("severity") == "critical"

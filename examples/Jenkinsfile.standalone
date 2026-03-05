@@ -6,11 +6,11 @@
  *
  * Prerequisites:
  *   1. Create Jenkins credentials:
- *      - 'gitlab-token'      → Secret text (GitLab PAT with api scope)
- *      - 'aws-bedrock-creds' → Username/Password (AWS access key / secret key)
+ *      - 'github-token' -> Secret text (GitHub PAT with repo scope)
  *   2. Ensure Claude models are enabled in your AWS Bedrock account.
  *   3. Place scripts/review.py in your repo (or adjust the path below).
- *   4. Set GITLAB_PROJECT_ID and MR_IID as pipeline parameters or env vars.
+ *   4. Set GITHUB_REPO and PR_NUMBER as pipeline parameters or env vars,
+ *      or use a multibranch pipeline (CHANGE_ID is auto-detected).
  */
 
 pipeline {
@@ -29,21 +29,25 @@ pipeline {
     environment {
         CLAUDE_CODE_USE_BEDROCK = '1'
         AWS_REGION = 'us-east-1'
-        // For self-hosted GitLab, override:
-        // GITLAB_API_URL = 'https://gitlab.example.com/api/v4'
+        // For GitHub Enterprise Server, override:
+        // GITHUB_API_URL = 'https://github.example.com/api/v3'
     }
 
     stages {
         stage('Install Claude Code') {
             when {
                 expression {
-                    env.gitlabMergeRequestIid != null ||
-                    env.MR_IID != null ||
-                    env.CHANGE_ID != null
+                    env.CHANGE_ID != null ||
+                    env.ghprbPullId != null ||
+                    env.GITHUB_PR_NUMBER != null
                 }
             }
             steps {
                 sh '''
+                    apt-get update
+                    apt-get install -y --no-install-recommends python3 ca-certificates git curl
+                    rm -rf /var/lib/apt/lists/*
+
                     npm install -g @anthropic-ai/claude-code
                     claude --version
                 '''
@@ -53,36 +57,38 @@ pipeline {
         stage('Run Review') {
             when {
                 expression {
-                    env.gitlabMergeRequestIid != null ||
-                    env.MR_IID != null ||
-                    env.CHANGE_ID != null
+                    env.CHANGE_ID != null ||
+                    env.ghprbPullId != null ||
+                    env.GITHUB_PR_NUMBER != null
                 }
             }
             steps {
                 withCredentials([
-                    string(credentialsId: 'gitlab-token', variable: 'GITLAB_TOKEN'),
-                    usernamePassword(
-                        credentialsId: 'aws-bedrock-creds',
-                        usernameVariable: 'AWS_ACCESS_KEY_ID',
-                        passwordVariable: 'AWS_SECRET_ACCESS_KEY'
-                    )
+                    string(credentialsId: 'github-token', variable: 'GITHUB_TOKEN')
                 ]) {
                     script {
-                        // Derive MR IID from Jenkins env
-                        def mrIid = env.gitlabMergeRequestIid ?:
-                                    env.MR_IID ?:
-                                    env.CHANGE_ID ?: ''
-                        def projectId = env.gitlabMergeRequestTargetProjectId ?:
-                                        env.GITLAB_PROJECT_ID ?: ''
+                        // Derive PR number from Jenkins env
+                        def prNumber = env.CHANGE_ID ?:
+                                       env.ghprbPullId ?:
+                                       env.GITHUB_PR_NUMBER ?: ''
 
-                        if (!projectId || !mrIid) {
-                            echo 'Not an MR build or missing GITLAB_PROJECT_ID — skipping review.'
+                        // Auto-detect repo from GIT_URL
+                        def githubRepo = env.GITHUB_REPO ?: ''
+                        if (!githubRepo && env.GIT_URL) {
+                            def matcher = env.GIT_URL =~ /github\.com[:\\/]([^\\/]+\/[^\\/]+?)(?:\.git)?$/
+                            if (matcher.find()) {
+                                githubRepo = matcher.group(1)
+                            }
+                        }
+
+                        if (!githubRepo || !prNumber) {
+                            echo 'Not a PR build or missing GITHUB_REPO — skipping review.'
                             return
                         }
 
                         withEnv([
-                            "GITLAB_PROJECT_ID=${projectId}",
-                            "MR_IID=${mrIid}",
+                            "GITHUB_REPO=${githubRepo}",
+                            "PR_NUMBER=${prNumber}",
                         ]) {
                             sh 'python3 scripts/review.py'
                         }

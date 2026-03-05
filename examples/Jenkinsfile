@@ -1,24 +1,25 @@
 /**
- * Example Jenkinsfile — drop this into any repo to enable Claude Code MR reviews on GitLab.
+ * Example Jenkinsfile — drop this into any repo to enable Claude Code PR reviews on GitHub.
+ *
+ * Supports both automatic (multibranch PR builds) and manual triggering via "Build with Parameters".
  *
  * Prerequisites:
  *   1. Add this repo as a Jenkins Shared Library named "claude-code-reviewer"
- *      (Manage Jenkins → System → Global Pipeline Libraries)
+ *      (Manage Jenkins -> System -> Global Pipeline Libraries)
  *   2. Create Jenkins credentials:
- *      - 'gitlab-token'      → Secret text (GitLab PAT with api scope)
- *      - 'aws-bedrock-creds' → Username/Password (AWS access key / secret key)
+ *      - 'github-token' -> Secret text (GitHub PAT with repo scope)
  *   3. Ensure Claude models are enabled in your AWS Bedrock account.
- *   4. Set GITLAB_PROJECT_ID as a pipeline parameter or env var.
- *
- * The pipeline runs only on merge request builds.
- * MR IID is auto-detected from the GitLab Branch Source plugin (gitlabMergeRequestIid)
- * or the MR_IID / CHANGE_ID env vars.
  */
 
 @Library('claude-code-reviewer') _
 
 pipeline {
     agent any
+
+    parameters {
+        string(name: 'PR_NUMBER', defaultValue: '', description: 'Pull request number to review (leave blank for auto-detection)')
+        string(name: 'GITHUB_REPO', defaultValue: '', description: 'GitHub repo as owner/repo (leave blank for auto-detection from GIT_URL)')
+    }
 
     options {
         timeout(time: 10, unit: 'MINUTES')
@@ -29,25 +30,26 @@ pipeline {
         stage('Claude Code Review') {
             when {
                 expression {
-                    env.gitlabMergeRequestIid != null ||
-                    env.MR_IID != null ||
-                    env.CHANGE_ID != null
+                    params.PR_NUMBER ||
+                    env.CHANGE_ID != null ||
+                    env.ghprbPullId != null ||
+                    env.GITHUB_PR_NUMBER != null
                 }
             }
             steps {
                 claudeReview(
-                    awsCredentialsId: 'aws-bedrock-creds',
-                    gitlabTokenCredentialsId: 'gitlab-token',
+                    githubTokenCredentialsId: 'github-token',
                     awsRegion: 'us-east-1',
+                    prNumber: params.PR_NUMBER ?: '',
+                    githubRepo: params.GITHUB_REPO ?: '',
 
-                    // Required: GitLab project ID (numeric or path-encoded)
-                    // gitlabProjectId: '12345',
+                    // Optional: Bedrock inference profile or model ID
+                    // bedrockInferenceProfile: 'arn:aws:bedrock:us-east-1:123456789012:inference-profile/your-profile',
 
-                    // Optional: self-hosted GitLab
-                    // gitlabApiUrl: 'https://gitlab.example.com/api/v4',
+                    // Optional: GitHub Enterprise Server
+                    // githubApiUrl: 'https://github.example.com/api/v3',
 
                     // Optional overrides:
-                    // claudeModel: 'us.anthropic.claude-sonnet-4-6',
                     // includePatterns: '*.py,*.js,*.ts,*.go,*.java',
                     // excludePatterns: '*.lock,*.min.js,package-lock.json',
                     // maxDiffSize: '150000',

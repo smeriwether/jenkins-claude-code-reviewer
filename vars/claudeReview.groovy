@@ -3,22 +3,22 @@
 /**
  * claudeReview — Jenkins Shared Library step
  *
- * Runs Claude Code as an automated MR reviewer via AWS Bedrock.
- * Posts review comments (summary note + inline discussions) to a GitLab merge request.
+ * Runs Claude Code as an automated PR reviewer via AWS Bedrock.
+ * Posts review comments (summary + inline comments) to a GitHub pull request.
  *
  * Usage in a Jenkinsfile:
  *
  *   @Library('claude-code-reviewer') _
  *   claudeReview(
- *       gitlabTokenCredentialsId: 'gitlab-token',
+ *       githubTokenCredentialsId: 'github-token',
  *       awsRegion: 'us-east-1',
  *       bedrockInferenceProfile: 'arn:aws:bedrock:us-east-1:123456789012:inference-profile/your-profile',
  *   )
  *
  * Parameters:
- *   gitlabTokenCredentialsId   - Jenkins credentials ID for GitLab PAT (type: Secret text)
+ *   githubTokenCredentialsId   - Jenkins credentials ID for GitHub PAT (type: Secret text)
  *   awsRegion                  - AWS region for Bedrock (default: us-east-1)
- *   gitlabApiUrl               - GitLab API base URL (default: https://gitlab.com/api/v4)
+ *   githubApiUrl               - GitHub API base URL (default: https://api.github.com)
  *   bedrockInferenceProfile    - Bedrock inference profile ARN or Bedrock model ID to pass to Claude Code `--model`
  *   maxTokens                  - Max output tokens (default: 16384)
  *   includePatterns            - Comma-separated file globs to include (e.g. "*.py,*.js")
@@ -26,8 +26,8 @@
  *   maxDiffSize                - Max diff bytes before truncation (default: 100000)
  *   failOnFindings             - Fail the build on critical findings (default: false)
  *   dockerImage                - Docker image to run in (default: node:20-slim)
- *   gitlabProjectId            - GitLab project ID override (default: auto-detected)
- *   mrIid                      - MR IID override (default: auto-detected)
+ *   githubRepo                 - GitHub repo override (format: owner/repo; default: auto-detected from GIT_URL)
+ *   prNumber                   - PR number override (default: auto-detected)
  *
  * AWS authentication note:
  * - This step intentionally does NOT bind AWS access key/secret key.
@@ -36,9 +36,9 @@
 
 def call(Map config = [:]) {
     // Defaults
-    def gitlabTokenCredentialsId  = config.get('gitlabTokenCredentialsId', 'gitlab-token')
+    def githubTokenCredentialsId  = config.get('githubTokenCredentialsId', 'github-token')
     def awsRegion                 = config.get('awsRegion', 'us-east-1')
-    def gitlabApiUrl              = config.get('gitlabApiUrl', 'https://gitlab.com/api/v4')
+    def githubApiUrl              = config.get('githubApiUrl', 'https://api.github.com')
     def bedrockInferenceProfile   = config.get('bedrockInferenceProfile', config.get('claudeModel', ''))
     def maxTokens                 = config.get('maxTokens', '16384')
     def includePatterns           = config.get('includePatterns', '')
@@ -47,23 +47,24 @@ def call(Map config = [:]) {
     def failOnFindings            = config.get('failOnFindings', false)
     def dockerImage               = config.get('dockerImage', 'node:20-slim')
 
-    // Resolve MR IID and project ID from environment
-    // Supports: GitLab Branch Source plugin (gitlabMergeRequestIid, gitlabSourceRepoName),
-    //           explicit env vars, or manual overrides
-    def mrIid = config.get('mrIid',
-        env.gitlabMergeRequestIid ?: env.gitlabMergeRequestId ?: env.MR_IID ?: env.CHANGE_ID ?: '')
-    def gitlabProjectId = config.get('gitlabProjectId',
-        env.gitlabMergeRequestTargetProjectId ?: env.GITLAB_PROJECT_ID ?: '')
+    // Resolve PR number from environment
+    // Supports: GitHub Branch Source plugin (CHANGE_ID), GitHub Pull Request Builder (ghprbPullId),
+    //           explicit env var (GITHUB_PR_NUMBER), or manual override
+    def prNumber = config.get('prNumber',
+        env.CHANGE_ID ?: env.ghprbPullId ?: env.GITHUB_PR_NUMBER ?: '')
 
-    if (!mrIid) {
-        echo "claudeReview: No MR IID detected (gitlabMergeRequestIid / MR_IID / CHANGE_ID). Skipping."
+    // Resolve GitHub repo (owner/repo) from environment
+    def githubRepo = config.get('githubRepo', _detectGithubRepo())
+
+    if (!prNumber) {
+        echo "claudeReview: No PR number detected (CHANGE_ID / ghprbPullId / GITHUB_PR_NUMBER). Skipping."
         return
     }
-    if (!gitlabProjectId) {
-        error "claudeReview: Could not determine GitLab project ID. Set 'gitlabProjectId' parameter or GITLAB_PROJECT_ID env var."
+    if (!githubRepo) {
+        error "claudeReview: Could not determine GitHub repo. Set 'githubRepo' parameter or GITHUB_REPO env var."
     }
 
-    echo "claudeReview: Reviewing MR !${mrIid} in project ${gitlabProjectId}"
+    echo "claudeReview: Reviewing PR #${prNumber} in ${githubRepo}"
 
     docker.image(dockerImage).inside('--entrypoint=""') {
         // Install dependencies inside the container
@@ -79,17 +80,17 @@ def call(Map config = [:]) {
             python3 --version
         '''
 
-        // Bind GitLab credentials and run the review script.
+        // Bind GitHub credentials and run the review script.
         // AWS credentials are expected to come from the environment (instance profile, IRSA, etc.).
         withCredentials([
-            string(credentialsId: gitlabTokenCredentialsId, variable: 'GITLAB_TOKEN')
+            string(credentialsId: githubTokenCredentialsId, variable: 'GITHUB_TOKEN')
         ]) {
             def envVars = [
                 "CLAUDE_CODE_USE_BEDROCK=1",
                 "AWS_REGION=${awsRegion}",
-                "GITLAB_API_URL=${gitlabApiUrl}",
-                "GITLAB_PROJECT_ID=${gitlabProjectId}",
-                "MR_IID=${mrIid}",
+                "GITHUB_API_URL=${githubApiUrl}",
+                "GITHUB_REPO=${githubRepo}",
+                "PR_NUMBER=${prNumber}",
                 "BEDROCK_INFERENCE_PROFILE=${bedrockInferenceProfile}",
                 "CLAUDE_MODEL=${bedrockInferenceProfile}",
                 "CLAUDE_MAX_TOKENS=${maxTokens}",
@@ -107,4 +108,39 @@ def call(Map config = [:]) {
             }
         }
     }
+}
+
+/**
+ * Auto-detect GitHub repo (owner/repo) from environment variables.
+ * Parses GIT_URL or CHANGE_URL for github.com patterns.
+ */
+private String _detectGithubRepo() {
+    // Check explicit env var first
+    if (env.GITHUB_REPO) {
+        return env.GITHUB_REPO
+    }
+
+    // Try GIT_URL (set by Jenkins Git plugin)
+    def gitUrl = env.GIT_URL ?: ''
+    def repo = _parseGithubRepo(gitUrl)
+    if (repo) return repo
+
+    // Try CHANGE_URL (set by multibranch pipelines)
+    def changeUrl = env.CHANGE_URL ?: ''
+    repo = _parseGithubRepo(changeUrl)
+    if (repo) return repo
+
+    return ''
+}
+
+/**
+ * Parse owner/repo from a GitHub URL (HTTPS or SSH).
+ */
+private String _parseGithubRepo(String url) {
+    if (!url) return ''
+    def matcher = url =~ /github\.com[:\\/]([^\\/]+\/[^\\/]+?)(?:\.git)?$/
+    if (matcher.find()) {
+        return matcher.group(1)
+    }
+    return ''
 }
