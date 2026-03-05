@@ -1,0 +1,88 @@
+/**
+ * Standalone Jenkinsfile — no Shared Library required.
+ *
+ * Copy this file + scripts/review.py into your repo.
+ * Useful if you don't want to set up a Jenkins Shared Library.
+ *
+ * Prerequisites:
+ *   1. Create Jenkins credentials:
+ *      - 'github-token'      → Secret text (GitHub PAT with repo scope)
+ *      - 'aws-bedrock-creds' → Username/Password (AWS access key / secret key)
+ *   2. Ensure Claude models are enabled in your AWS Bedrock account.
+ *   3. Place scripts/review.py in your repo (or adjust the path below).
+ */
+
+pipeline {
+    agent {
+        docker {
+            image 'node:20-slim'
+            args '--entrypoint=""'
+        }
+    }
+
+    options {
+        timeout(time: 10, unit: 'MINUTES')
+        disableConcurrentBuilds()
+    }
+
+    environment {
+        CLAUDE_CODE_USE_BEDROCK = '1'
+        AWS_REGION = 'us-east-1'
+    }
+
+    stages {
+        stage('Install Claude Code') {
+            when {
+                expression { env.CHANGE_ID != null }
+            }
+            steps {
+                sh '''
+                    npm install -g @anthropic-ai/claude-code
+                    claude --version
+                '''
+            }
+        }
+
+        stage('Run Review') {
+            when {
+                expression { env.CHANGE_ID != null }
+            }
+            steps {
+                withCredentials([
+                    string(credentialsId: 'github-token', variable: 'GITHUB_TOKEN'),
+                    usernamePassword(
+                        credentialsId: 'aws-bedrock-creds',
+                        usernameVariable: 'AWS_ACCESS_KEY_ID',
+                        passwordVariable: 'AWS_SECRET_ACCESS_KEY'
+                    )
+                ]) {
+                    script {
+                        // Derive repo and PR number from Jenkins env
+                        def repo = env.CHANGE_URL
+                            ?.replaceAll('https://github.com/', '')
+                            ?.replaceAll('/pull/.*', '') ?: ''
+                        def prNum = env.CHANGE_ID ?: ''
+
+                        if (!repo || !prNum) {
+                            echo 'Not a PR build — skipping review.'
+                            return
+                        }
+
+                        withEnv([
+                            "GITHUB_REPOSITORY=${repo}",
+                            "PR_NUMBER=${prNum}",
+                        ]) {
+                            sh 'python3 scripts/review.py'
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        failure {
+            echo 'Claude Code review failed. Check the console output for details.'
+        }
+    }
+}
