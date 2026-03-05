@@ -64,7 +64,7 @@ def call(Map config = [:]) {
 
     echo "claudeReview: Reviewing PR #${prNumber} in ${githubRepo}"
 
-    docker.image(dockerImage).inside('--entrypoint=""') {
+    docker.image(dockerImage).inside('--entrypoint="" -u root') {
         // Install dependencies inside the container
         sh '''#!/bin/bash
             set -euxo pipefail
