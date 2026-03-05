@@ -10,17 +10,16 @@
  *
  *   @Library('claude-code-reviewer') _
  *   claudeReview(
- *       awsCredentialsId: 'aws-bedrock-creds',
  *       gitlabTokenCredentialsId: 'gitlab-token',
  *       awsRegion: 'us-east-1',
+ *       bedrockInferenceProfile: 'arn:aws:bedrock:us-east-1:123456789012:inference-profile/your-profile',
  *   )
  *
  * Parameters:
- *   awsCredentialsId           - Jenkins credentials ID for AWS (type: Username/Password)
  *   gitlabTokenCredentialsId   - Jenkins credentials ID for GitLab PAT (type: Secret text)
  *   awsRegion                  - AWS region for Bedrock (default: us-east-1)
  *   gitlabApiUrl               - GitLab API base URL (default: https://gitlab.com/api/v4)
- *   claudeModel                - Bedrock model ID (default: auto-selected by Claude Code)
+ *   bedrockInferenceProfile    - Bedrock inference profile ARN or Bedrock model ID to pass to Claude Code `--model`
  *   maxTokens                  - Max output tokens (default: 16384)
  *   includePatterns            - Comma-separated file globs to include (e.g. "*.py,*.js")
  *   excludePatterns            - Comma-separated file globs to exclude (e.g. "*.lock,*.min.js")
@@ -29,15 +28,18 @@
  *   dockerImage                - Docker image to run in (default: node:20-slim)
  *   gitlabProjectId            - GitLab project ID override (default: auto-detected)
  *   mrIid                      - MR IID override (default: auto-detected)
+ *
+ * AWS authentication note:
+ * - This step intentionally does NOT bind AWS access key/secret key.
+ * - It expects role-based auth to be provided by the Jenkins agent runtime (instance profile on EC2, IRSA on EKS, etc.).
  */
 
 def call(Map config = [:]) {
     // Defaults
-    def awsCredentialsId          = config.get('awsCredentialsId', 'aws-bedrock-creds')
     def gitlabTokenCredentialsId  = config.get('gitlabTokenCredentialsId', 'gitlab-token')
     def awsRegion                 = config.get('awsRegion', 'us-east-1')
     def gitlabApiUrl              = config.get('gitlabApiUrl', 'https://gitlab.com/api/v4')
-    def claudeModel               = config.get('claudeModel', '')
+    def bedrockInferenceProfile   = config.get('bedrockInferenceProfile', config.get('claudeModel', ''))
     def maxTokens                 = config.get('maxTokens', '16384')
     def includePatterns           = config.get('includePatterns', '')
     def excludePatterns           = config.get('excludePatterns', '')
@@ -64,20 +66,23 @@ def call(Map config = [:]) {
     echo "claudeReview: Reviewing MR !${mrIid} in project ${gitlabProjectId}"
 
     docker.image(dockerImage).inside('--entrypoint=""') {
-        // Install Claude Code
+        // Install dependencies inside the container
         sh '''
+            set -euxo pipefail
+            # node:*-slim images don't include Python; we need it for the review script.
+            apt-get update
+            apt-get install -y --no-install-recommends python3 ca-certificates git curl
+            rm -rf /var/lib/apt/lists/*
+
             npm install -g @anthropic-ai/claude-code 2>&1
             claude --version
+            python3 --version
         '''
 
-        // Bind credentials and run the review script
+        // Bind GitLab credentials and run the review script.
+        // AWS credentials are expected to come from the environment (instance profile, IRSA, etc.).
         withCredentials([
-            string(credentialsId: gitlabTokenCredentialsId, variable: 'GITLAB_TOKEN'),
-            usernamePassword(
-                credentialsId: awsCredentialsId,
-                usernameVariable: 'AWS_ACCESS_KEY_ID',
-                passwordVariable: 'AWS_SECRET_ACCESS_KEY'
-            )
+            string(credentialsId: gitlabTokenCredentialsId, variable: 'GITLAB_TOKEN')
         ]) {
             def envVars = [
                 "CLAUDE_CODE_USE_BEDROCK=1",
@@ -85,7 +90,8 @@ def call(Map config = [:]) {
                 "GITLAB_API_URL=${gitlabApiUrl}",
                 "GITLAB_PROJECT_ID=${gitlabProjectId}",
                 "MR_IID=${mrIid}",
-                "CLAUDE_MODEL=${claudeModel}",
+                "BEDROCK_INFERENCE_PROFILE=${bedrockInferenceProfile}",
+                "CLAUDE_MODEL=${bedrockInferenceProfile}",
                 "CLAUDE_MAX_TOKENS=${maxTokens}",
                 "INCLUDE_PATTERNS=${includePatterns}",
                 "EXCLUDE_PATTERNS=${excludePatterns}",

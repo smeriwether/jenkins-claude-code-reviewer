@@ -20,7 +20,9 @@ Drop it into any repo. Claude reviews the MR diff, posts a summary note and inli
 - **Docker** available on the Jenkins agent
 - **AWS account** with Bedrock access and Claude models enabled
 - **GitLab personal access token** with `api` scope
-- **Node.js 18+** available in the Docker image (default: `node:20-slim`)
+- **Docker** available on the Jenkins agent (default image: `node:20-slim`)
+
+> AWS auth: this project is designed for **role-based AWS credentials** (instance profile / IRSA / assumed role). It does **not** require static access keys.
 
 ## Quick Start
 
@@ -36,7 +38,8 @@ Drop it into any repo. Claude reviews the MR diff, posts a summary note and inli
 
 2. **Create Jenkins credentials:**
    - `gitlab-token` → *Secret text* — your GitLab PAT (requires `api` scope)
-   - `aws-bedrock-creds` → *Username with password* — AWS Access Key ID / Secret Access Key
+
+   AWS credentials are **not** configured as Jenkins secrets. Use role-based auth on the Jenkins agent (instance profile / IRSA / assumed role).
 
 3. **Add to your repo's Jenkinsfile:**
 
@@ -55,9 +58,9 @@ pipeline {
             }
             steps {
                 claudeReview(
-                    awsCredentialsId: 'aws-bedrock-creds',
                     gitlabTokenCredentialsId: 'gitlab-token',
                     awsRegion: 'us-east-1',
+                    bedrockInferenceProfile: 'arn:aws:bedrock:us-east-1:123456789012:inference-profile/your-profile',
                     // gitlabProjectId: '12345',  // if not auto-detected
                 )
             }
@@ -104,7 +107,8 @@ Store the token as a **Secret text** credential in Jenkins (e.g., `gitlab-token`
 | Credential ID | Type | Contents |
 |---|---|---|
 | `gitlab-token` | Secret text | GitLab PAT with `api` scope |
-| `aws-bedrock-creds` | Username with password | AWS Access Key ID (username) / Secret Access Key (password) |
+
+AWS: use **role-based credentials** on the Jenkins agent (instance profile / IRSA). Do not store long-lived AWS keys in Jenkins.
 
 ### MR Detection
 
@@ -130,13 +134,13 @@ All parameters are passed to `claudeReview()` (Shared Library) or set as environ
 
 | Parameter | Env Var | Default | Description |
 |---|---|---|---|
-| `awsCredentialsId` | — | `aws-bedrock-creds` | Jenkins credentials ID for AWS |
 | `gitlabTokenCredentialsId` | — | `gitlab-token` | Jenkins credentials ID for GitLab PAT |
 | `awsRegion` | `AWS_REGION` | `us-east-1` | AWS region for Bedrock |
 | `gitlabApiUrl` | `GITLAB_API_URL` | `https://gitlab.com/api/v4` | GitLab API base URL (for self-hosted) |
 | `gitlabProjectId` | `GITLAB_PROJECT_ID` | *(auto-detected)* | GitLab project ID (numeric or URL-encoded path) |
 | `mrIid` | `MR_IID` | *(auto-detected)* | Merge request IID |
-| `claudeModel` | `CLAUDE_MODEL` | *(auto)* | Bedrock model ID (e.g. `us.anthropic.claude-sonnet-4-6`) |
+| `bedrockInferenceProfile` | `BEDROCK_INFERENCE_PROFILE` | *(auto)* | Bedrock inference profile ARN **or** Bedrock model ID passed to Claude Code `--model` |
+| `claudeModel` | `CLAUDE_MODEL` | *(deprecated)* | Alias for `bedrockInferenceProfile` |
 | `maxTokens` | `CLAUDE_MAX_TOKENS` | `16384` | Max output tokens |
 | `includePatterns` | `INCLUDE_PATTERNS` | *(all files)* | Comma-separated globs to include (e.g. `*.py,*.js`) |
 | `excludePatterns` | `EXCLUDE_PATTERNS` | *(none)* | Comma-separated globs to exclude (e.g. `*.lock,*.min.js`) |

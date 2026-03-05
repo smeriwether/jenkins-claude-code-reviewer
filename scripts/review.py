@@ -12,8 +12,8 @@ Required environment variables:
     MR_IID              - Merge request IID (internal ID)
     CLAUDE_CODE_USE_BEDROCK=1
     AWS_REGION          - e.g. us-east-1
-    AWS_ACCESS_KEY_ID   - (or use instance role)
-    AWS_SECRET_ACCESS_KEY
+    AWS auth is expected via the standard AWS credential chain (instance profile, IRSA, assumed role, etc.).
+    Do NOT require long-lived AWS access keys.
 
 Optional environment variables:
     GITLAB_API_URL          - GitLab API base URL (default: https://gitlab.com/api/v4)
@@ -45,7 +45,8 @@ GITLAB_PROJECT_ID = os.environ["GITLAB_PROJECT_ID"]
 MR_IID = os.environ["MR_IID"]
 GITLAB_API_URL = os.environ.get("GITLAB_API_URL", "https://gitlab.com/api/v4")
 
-CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "")
+# Accept either CLAUDE_MODEL (legacy) or BEDROCK_INFERENCE_PROFILE (preferred)
+CLAUDE_MODEL = os.environ.get("BEDROCK_INFERENCE_PROFILE", os.environ.get("CLAUDE_MODEL", ""))
 CLAUDE_MAX_TOKENS = os.environ.get("CLAUDE_MAX_TOKENS", "16384")
 INCLUDE_PATTERNS = [
     p.strip()
