@@ -66,7 +66,7 @@ def call(Map config = [:]) {
 
     docker.image(dockerImage).inside('--entrypoint=""') {
         // Install dependencies inside the container
-        sh '''
+        sh '''#!/bin/bash
             set -euxo pipefail
             # node:*-slim images don't include Python; we need it for the review script.
             apt-get update
